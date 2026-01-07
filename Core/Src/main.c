@@ -87,11 +87,13 @@ uint16_t smoothed_ADCArray[2]; // Array to store the smoothed voltage and curren
 char OLED_Message[20]; // String buffer for formatted output on the OLED screen
 
 // PCB Button
-int button = 0; // Tracks button state (e.g. pressed or not)
+int SW2 = 0;
+int SW3 = 0;
 
-
+// Motor Commands
 int32_t left_cmd = 0;  // Motor command values
 int32_t right_cmd = 0; // Motor command values
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,87 +114,109 @@ void Send_Encoder_Counts(void) {
 
 // Remote control
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART2) {
-        // Append the newly received byte (stored in Command_Message[0]) into the ring buffer
-        uint8_t b = Command_Message[0];
-        uart_ring[uart_head] = b;
-        uart_head = (uart_head + 1) % UART_RING_SIZE;
-        // If buffer overflow, advance tail to drop oldest byte
-        if (uart_head == uart_tail) {
-            uart_tail = (uart_tail + 1) % UART_RING_SIZE;
-        }
+	if (huart->Instance == USART2) {
+		// Append the newly received byte (stored in Command_Message[0]) into the ring buffer
+		uint8_t b = Command_Message[0];
+		uart_ring[uart_head] = b;
+		uart_head = (uart_head + 1) % UART_RING_SIZE;
+		// If buffer overflow, advance tail to drop oldest byte
+		if (uart_head == uart_tail) {
+			uart_tail = (uart_tail + 1) % UART_RING_SIZE;
+		}
 
-        // Try to parse as many complete frames as possible
-        uint16_t count = (uart_head + UART_RING_SIZE - uart_tail) % UART_RING_SIZE;
-        uint16_t offset = 0; // offset from current tail within available bytes
-        // Use a temporary linear view to simplify parsing logic
-        while ((count - offset) >= FRAME_LEN) {
-            // Read potential header at (tail + offset)
-            uint16_t idx = (uart_tail + offset) % UART_RING_SIZE;
-            if (uart_ring[idx] != UART_HEADER) {
-                // not a header, skip this byte
-                offset++;
-                continue;
-            }
-            // Ensure footer is in place at header+10
-            uint16_t footer_idx = (idx + FRAME_LEN - 1) % UART_RING_SIZE; // header + 10
-            if (uart_ring[footer_idx] != UART_FOOTER) {
-                // footer mismatch -> this header is invalid; skip this header byte
-                offset++;
-                continue;
-            }
+		// Try to parse as many complete frames as possible
+		uint16_t count = (uart_head + UART_RING_SIZE - uart_tail)
+				% UART_RING_SIZE;
+		uint16_t offset = 0; // offset from current tail within available bytes
+		// Use a temporary linear view to simplify parsing logic
+		while ((count - offset) >= FRAME_LEN) {
+			// Read potential header at (tail + offset)
+			uint16_t idx = (uart_tail + offset) % UART_RING_SIZE;
+			if (uart_ring[idx] != UART_HEADER) {
+				// not a header, skip this byte
+				offset++;
+				continue;
+			}
+			// Ensure footer is in place at header+10
+			uint16_t footer_idx = (idx + FRAME_LEN - 1) % UART_RING_SIZE; // header + 10
+			if (uart_ring[footer_idx] != UART_FOOTER) {
+				// footer mismatch -> this header is invalid; skip this header byte
+				offset++;
+				continue;
+			}
 
-            // We have a candidate valid frame; copy payload bytes (big-endian)
-            uint8_t payload[9];
-            for (int i = 0; i < 9; ++i) {
-                payload[i] = uart_ring[(idx + 1 + i) % UART_RING_SIZE];
-            }
+			// We have a candidate valid frame; copy payload bytes (big-endian)
+			uint8_t payload[9];
+			for (int i = 0; i < 9; ++i) {
+				payload[i] = uart_ring[(idx + 1 + i) % UART_RING_SIZE];
+			}
 
-            // Decode 16-bit big-endian values
-            uint32_t m1 = ((uint32_t)payload[0] << 8) | payload[1];
-            uint32_t m2 = ((uint32_t)payload[2] << 8) | payload[3];
-            uint32_t s1 = ((uint32_t)payload[4] << 8) | payload[5];
-            uint32_t s2 = ((uint32_t)payload[6] << 8) | payload[7];
-            uint8_t dir = payload[8];
+			// Decode 16-bit big-endian values
+			uint32_t m1 = ((uint32_t) payload[0] << 8) | payload[1];
+			uint32_t m2 = ((uint32_t) payload[2] << 8) | payload[3];
+			uint32_t s1 = ((uint32_t) payload[4] << 8) | payload[5];
+			uint32_t s2 = ((uint32_t) payload[6] << 8) | payload[7];
+			uint8_t dir = payload[8];
 
+			// Clamp servo values to safe range 1000..1400 (per request)
+			if (s1 < 1000U)
+				s1 = 1000U;
+			else if (s1 > 1400U)
+				s1 = 1400U;
+			if (s2 < 1000U)
+				s2 = 1000U;
+			else if (s2 > 1400U)
+				s2 = 1400U;
 
-            // Clamp servo values to safe range 1000..1400 (per request)
-            if (s1 < 1000U) s1 = 1000U;
-            else if (s1 > 1400U) s1 = 1400U;
-            if (s2 < 1000U) s2 = 1000U;
-            else if (s2 > 1400U) s2 = 1400U;
+			// Map directions: bit0 -> motor1, bit1 -> motor2. Per requirement: 0 = backward, 1 = forward
+			// ASSUMPTION: motor1 maps to left motor (htim12 channels), motor2 maps to right motor (htim4 channels).
+			left_cmd = (dir & 0x01) ? (int32_t) m1 : -(int32_t) m1;
+			right_cmd = (dir & 0x02) ? (int32_t) m2 : -(int32_t) m2;
 
-            // Map directions: bit0 -> motor1, bit1 -> motor2. Per requirement: 0 = backward, 1 = forward
-            // ASSUMPTION: motor1 maps to left motor (htim12 channels), motor2 maps to right motor (htim4 channels).
-            left_cmd = (dir & 0x01) ? (int32_t)m1 : -(int32_t)m1;
-            right_cmd = (dir & 0x02) ? (int32_t)m2 : -(int32_t)m2;
+			// Apply motors and servos
+			motor(left_cmd, right_cmd);
 
-            // Apply motors and servos
-            motor(left_cmd, right_cmd);
+			// Servos: directly set TIM8 compare registers
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, (uint32_t) s1);
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, (uint32_t) s2);
 
-            // Servos: directly set TIM8 compare registers
-            __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, (uint32_t)s1);
-            __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, (uint32_t)s2);
+			// Advance offset past this frame
+			offset += FRAME_LEN;
+		}
 
-            // Advance offset past this frame
-            offset += FRAME_LEN;
-        }
+		// Advance tail by offset (discard parsed or skipped bytes)
+		uart_tail = (uart_tail + offset) % UART_RING_SIZE;
 
-        // Advance tail by offset (discard parsed or skipped bytes)
-        uart_tail = (uart_tail + offset) % UART_RING_SIZE;
-
-        // Restart reception for next byte
-        HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, 1);
-    }
+		// Restart reception for next byte
+		HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, 1);
+	}
 }
 // PCB button interrupt
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == SW2_Pin) // Handle SW2 (PB12)
 	{
+		// Toggle gripper
+		SW2 = !SW2;
+		if (SW2) {
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, 1400); // Close gripper
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, 1400); // Reserved
+		} else {
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, 1000); // Open gripper
+			__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, 1000); // Reserved
+
+		}
 
 	} else if (GPIO_Pin == SW3_Pin) // Handle SW3 (PB13)
 	{
-
+		// Toggle motor
+		SW3 = !SW3;
+		if (SW3) {
+			left_cmd = 30000;
+			right_cmd = 30000;
+			motor(left_cmd, right_cmd); // Move forward
+		} else {
+			motor(0, 0); // Stop
+		}
 	}
 }
 // Motor control function
@@ -313,18 +337,15 @@ int main(void) {
 	// Start PWM on TIM8 CH1 and CH2
 	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
 	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
-	// Set servo angles (e.g., 90 degrees for both)
-	__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, 1000);
-	__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, 1400);
 
 	// Example on count encoder pulses using interrupts
 	HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_1 | TIM_CHANNEL_2);
 	HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_1 | TIM_CHANNEL_2);
 
 	// Start UART reception in interrupt mode
--    HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, RXBUFFERSIZE); // UASRT 2
-+    // Use single-byte interrupt-driven reception and a software ring buffer for framing
-+    HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, 1); // USART2 single-byte receive
+	-HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, RXBUFFERSIZE); // UASRT 2
+	+ // Use single-byte interrupt-driven reception and a software ring buffer for framing
+	+HAL_UART_Receive_IT(&huart2, (uint8_t*) Command_Message, 1); // USART2 single-byte receive
 
 	// ADC Values for voltage and current
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) ADCArray, 2);
@@ -339,7 +360,7 @@ int main(void) {
 	ssd1306_Fill(Black);
 
 	ssd1306_SetCursor(0, 0);  // Set cursor to an appropriate position
-	ssd1306_WriteString("3360 251221", Font_11x18, White);
+	ssd1306_WriteString("3360 251224", Font_11x18, White);
 	ssd1306_UpdateScreen();
 
 	HAL_Delay(1000);
@@ -369,18 +390,32 @@ int main(void) {
 		ssd1306_WriteString(OLED_Message, Font_11x18, White);
 
 		sprintf(OLED_Message, "L:%d%s", __HAL_TIM_GET_COUNTER(&htim2),
-				__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2) ? "B" : "F");
-		ssd1306_SetCursor(0, 15);
-		ssd1306_WriteString(OLED_Message, Font_11x18, White);
+				__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2) ? " B" : " F");
+		ssd1306_SetCursor(0, 16);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
 
 		sprintf(OLED_Message, "R:%d%s", __HAL_TIM_GET_COUNTER(&htim5),
-				__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim5) ? "B" : "F");
-		ssd1306_SetCursor(0, 30);
-		ssd1306_WriteString(OLED_Message, Font_11x18, White);
+				__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim5) ? " B" : " F");
+		ssd1306_SetCursor(0, 24);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
 
-		//sprintf(buffer, "%s", );
-		ssd1306_SetCursor(0, 45);
-		ssd1306_WriteString(OLED_Message, Font_11x18, White);
+		sprintf(OLED_Message, "Motor PWM L:%d", left_cmd);
+		ssd1306_SetCursor(0, 32);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
+
+		sprintf(OLED_Message, "Motor PWM R:%d", right_cmd);
+		ssd1306_SetCursor(0, 40);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
+
+		sprintf(OLED_Message, "Servo1:%d",
+				__HAL_TIM_GET_COMPARE(&htim8, TIM_CHANNEL_1));
+		ssd1306_SetCursor(0, 48);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
+
+		sprintf(OLED_Message, "Servo2:%d",
+				__HAL_TIM_GET_COMPARE(&htim8, TIM_CHANNEL_2));
+		ssd1306_SetCursor(0, 56);
+		ssd1306_WriteString(OLED_Message, Font_6x8, White);
 
 		// Update the OLED screen to reflect all changes
 		ssd1306_UpdateScreen();
